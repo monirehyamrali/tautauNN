@@ -12,12 +12,19 @@ import pickle
 from collections import defaultdict
 from getpass import getuser
 from copy import deepcopy
+from operator import or_
+from functools import reduce
 # from typing import Any
 
 import numpy as np
+import awkward as ak
 import tensorflow as tf
+import tensorflow_probability as tfp
 from law.util import human_duration
 from tabulate import tabulate
+import scipy.stats
+import glob
+from tqdm import tqdm
 
 from tautaunn.multi_dataset import MultiDataset
 from tautaunn.tf_util import (
@@ -37,7 +44,7 @@ use_gpu: bool = True
 # can occur (e.g. all batches are fine, and then one batch leads to a tensor being randomly transposed, or operations
 # not being applied at all), and whether the flag is needed or not might also depend on the tf and cuda version
 deterministic_ops: bool = True
-# run in eager mode (for proper debuggin, also consider decorating methods in question with @util.debug_layer)
+# run in eager mode (for proper debugging, also consider decorating methods in question with @util.debug_layer)
 eager_mode: bool = False
 # whether to jit compile via xla (not working on GPU right now)
 jit_compile: bool = False
@@ -73,6 +80,341 @@ if limit_cpus:
 if eager_mode:
     # note: running the following with False would still trigger partial eager mode in keras
     tf.config.run_functions_eagerly(eager_mode)
+    tf.debugging.enable_check_numerics()
+
+
+_z_data = {}
+
+# dm_mapping = {
+#     (-1, 0): (0, 0),
+#     (-1, 1): (0, 0),
+#     (-1, 10): (0, 0),
+#     (-1, 11): (0, 0),
+#     (0, -1): (0, 0),
+#     (0, 0): (0, 0),
+#     (0, 1): (0, 1),
+#     (0, 10): (0, 0),
+#     (0, 11): (0, 0),
+#     (1, -1): (0, 0),
+#     (1, 0): (0, 0),
+#     (1, 1): (0, 0),
+#     (1, 10): (0, 0),
+#     (1, 11): (0, 0),
+#     (10, -1): (0, 0),
+#     (10, 0): (0, 0),
+#     (10, 1): (0, 0),
+#     (10, 10): (0, 0),
+#     (10, 11): (0, 0),
+#     (11, -1): (0, 0),
+#     (11, 0): (0, 0),
+#     (11, 1): (0, 0),
+#     (11, 10): (0, 0),
+#     (11, 11): (0, 0),
+# }
+
+dm_mapping = {
+        (-1, 0): (-1, 0),
+        (-1, 1): (-1, 1),
+        (-1, 10): (-1, 10),
+        (-1, 11): (-1, 10),
+        (0, -1): (0, -1),
+        (0, 0): (0, 0),
+        (0, 1): (0, 1),
+        (0, 10): (0, 10),
+        (0, 11): (0, 10),
+        (1, -1): (1, -1),
+        (1, 0): (1, 0),
+        (1, 1): (1, 1),
+        (1, 10): (1, 10),
+        (1, 11): (1, 10),
+        (10, -1): (10, -1),
+        (10, 0): (10, 0),
+        (10, 1): (10, 1),
+        (10, 10): (10, 10),
+        (10, 11): (10, 10),
+        (11, -1): (10, -1),
+        (11, 0): (10, 0),
+        (11, 1): (10, 1),
+        (11, 10): (10, 10),
+        (11, 11): (10, 10),
+    }
+
+# load data for z-maps
+def data_z_map(cls_name, dm_pos, dm_neg, n_files=-1):
+    sample_name = {
+        "HH": "hh_ggf_bbtautau_madgraph",
+        "TT": "tt_dl_powheg",
+        "DY": "dy_lep_m50_amcatnlo",
+    }[cls_name]
+
+    if sample_name not in _z_data:
+
+        PATTERN = "/gpfs/dust/cms/user/yamralim/cf_cache/hbt_store/analysis_hbt/cf.UniteColumns/run2_2017_nano_uhh_v11/{}/nominal/calib__none/sel__default/prod__z_fractions/dev3_allz/data_*.parquet"
+        arrays = []
+        for i, path in enumerate(glob.glob(PATTERN.format(sample_name))):
+            arrays.append(ak.from_parquet(path))
+            if n_files < 0 and i+1 >= n_files:
+                break
+        _z_data[sample_name] = ak.concatenate(arrays, axis=0)
+
+    if not isinstance(dm_pos, tuple):
+        dm_pos = (dm_pos,)
+    if not isinstance(dm_neg, tuple):
+        dm_neg = (dm_neg,)
+    data = _z_data[sample_name]
+    dm_mask = (
+        reduce(or_, [(data.dm_pos == dm) for dm in dm_pos]) &
+        reduce(or_, [(data.dm_neg == dm) for dm in dm_neg])
+    )
+
+    return data[dm_mask][["z_gen_pos", "z_gen_neg"]].to_numpy()
+
+
+# choose the loss with the right shape
+@tf.function
+def z_loss_impl(loss_mode, y_true, y_pred, z_means, z_stds, z_maps, sample_weight=None):
+    if loss_mode == "baseline":
+        return z_loss_baseline_impl(y_true, y_pred, z_means, z_stds, sample_weight=sample_weight)
+    if loss_mode == "spin":
+        return spin_loss_impl(y_true, y_pred, z_means, z_stds, z_maps, sample_weight=sample_weight)
+    raise NotImplementedError(f"unknown loss mode: {loss_mode}")
+
+# baseline loss
+@tf.function
+def z_loss_baseline_impl(y_true, y_pred, z_means, z_stds, sample_weight=None):
+    y_pred_z = tf.math.maximum(tf.math.minimum(y_pred[:,:2], 0.999999), 0.000001)
+    y_true_z = tf.math.maximum(tf.math.minimum(y_true[:,:2], 0.999999), 0.000001)
+    #from IPython import embed; embed(header="baseline")
+
+    numerator = y_pred_z - y_true_z
+    denominator = y_pred_z + y_true_z - 2 * y_pred_z * y_true_z
+
+    first_term = y_pred_z * tf.math.atanh(tf.math.maximum(numerator / denominator, -0.999999))
+    second_term = 0.5 * tf.math.log(tf.abs(y_pred_z - 1)) - 0.5 * tf.math.log(tf.abs(y_true_z - 1))
+
+    loss = first_term + second_term
+        # if sample_weight is not None:
+    #     sample_weight = tf.cast(sample_weight, loss.dtype)
+    #     loss = loss * sample_weight
+    #     # Update dimensions of `sample_weight` to match `losses`.
+    #     # loss, sample_weight = squeeze_or_expand_to_same_rank(
+    #     #     loss, sample_weight
+    #     # )
+    #     loss = loss * sample_weight
+
+    #return loss
+    mean_weighted_loss = tf.reduce_mean(tf.reduce_sum(loss, axis=1))
+    return mean_weighted_loss
+
+
+# the spin loss
+@tf.function
+def spin_loss_impl(y_true, y_pred, z_means, z_stds, z_map_func, sample_weight=None):
+    e = 1.0
+    f = 0
+
+    # split into actual z values, decay modes and cls predictions
+    y_pred_z = tf.math.maximum(tf.math.minimum(y_pred[:,:2], 0.999999), 0.000001)
+    y_true_z = tf.math.maximum(tf.math.minimum(y_true[:,:2], 0.999999), 0.000001)
+
+    dm_pos = y_pred[:, 2]
+    dm_neg = y_pred[:, 3]
+
+    y_pred_cls = y_pred[:, 4:]
+    y_true_cls = y_true[:, 2:]
+    pred_true_cls = tf.reduce_sum(y_pred_cls * y_true_cls, axis=1)  # inperformant but gather is hard
+
+
+    m_true = z_map_func(y_true_z, y_true_cls, dm_pos, dm_neg)
+    m_pred = z_map_func(y_pred_z, y_true_cls, dm_pos, dm_neg)
+
+    numerator = y_pred_z - y_true_z
+    denominator = y_pred_z + y_true_z - 2 * y_pred_z * y_true_z
+
+    first_term = y_pred_z * tf.math.atanh(tf.math.maximum(numerator / denominator, -0.999999))
+    second_term = 0.5 * tf.math.log(tf.abs(y_pred_z - 1)) - 0.5 * tf.math.log(tf.abs(y_true_z - 1))
+    # z loss
+    loss_z = first_term + second_term
+
+    kl_loss = m_true * tf.math.abs(tf.math.log((m_true + 0.000001)/(m_pred + 0.000001))) * (f - e * tf.math.log(pred_true_cls))
+    #spin_loss = tf.math.log((y_true_z * y_true_cls)/(y_pred_z * y_pred_cls))
+    #spin_loss = (classification_loss ) * (loss_z ) # I don't know if we need the weights
+
+    # if sample_weight is not None:
+    #     sample_weight = tf.cast(sample_weight, loss.dtype)
+    #     loss = loss * sample_weight
+    #     # Update dimensions of `sample_weight` to match `losses`.
+    #     # loss, sample_weight = squeeze_or_expand_to_same_rank(
+    #     #     loss, sample_weight
+    #     # )
+    #     loss = loss * sample_weight
+
+    #return spin_loss
+    #spin_weighted_loss = tf.reduce_mean(spin_loss)
+    #spin_kl_loss = tf.reduce_mean(kl_loss + 1.0 * loss_z[:, 0] + 1.0 * loss_z[:, 1])
+    spin_kl_loss = tf.reduce_mean(kl_loss + tf.reduce_sum(loss_z, axis=1))
+
+    return spin_kl_loss
+
+
+# create z-maps
+class ZLoss(tf.keras.losses.Loss):
+
+    @classmethod
+    def kde(cls, z_vals, sigma=0.003, flip_threshold=0.01):
+        mu_flip_low = -scipy.stats.norm.ppf(flip_threshold, loc=0, scale=sigma)
+        mu_flip_high = 1 - mu_flip_low
+        max_2d_pdf = scipy.stats.norm.pdf(0, loc=0, scale=sigma)**2
+
+        # print("thresholds for flip:", mu_flip_low, mu_flip_high)
+
+        # old, serial approach
+        # determine pdfs
+        # pdfs = []
+        # for zp, zn in z_vals:
+        #     # central pdf
+        #     # multi_norm = lambda zx, zy: multivariate_normal([zx, zy], [[sigma, 0], [0, sigma]])
+        #     multi_norm = lambda zp, zn: tfp.distributions.MultivariateNormalDiag(loc=[float(zp), float(zn)], scale_diag=[sigma, sigma]).prob
+        #     pdfs.append(multi_norm(zp, zn))
+        #     # optional left tail if cut off integral is below 0.001
+        #     if zp <= mu_flip_low:
+        #         pdfs.append(multi_norm(-zp, zn))
+        #     # right tail
+        #     if zp >= mu_flip_high:
+        #         pdfs.append(multi_norm(2 - zp, zn))
+        #     # bottom tail
+        #     if zn <= mu_flip_low:
+        #         pdfs.append(multi_norm(zp, -zn))
+        #     # top tail
+        #     if zn >= mu_flip_high:
+        #         pdfs.append(multi_norm(zp, 2 - zn))
+        # @tf.function(input_signature=[tf.TensorSpec(shape=[None, 2], dtype=tf.float32)])
+        # def map_func(vals):
+        #     return sum(pdf(vals) for pdf in pdfs) / len(z_vals)
+
+        # new approch using vectorized multivariate
+        loc = []
+        scale = []
+        def add_point(zp, zn):
+            loc.append([float(zp), float(zn)])
+            scale.append([float(sigma), float(sigma)])
+        for zp, zn in z_vals:
+            # central pdf
+            add_point(zp, zn)
+            # optional left tail if cut off integral is below 0.001
+            if zp <= mu_flip_low:
+                add_point(-zp, zn)
+            # right tail
+            if zp >= mu_flip_high:
+                add_point(2 - zp, zn)
+            # bottom tail
+            if zn <= mu_flip_low:
+                add_point(zp, -zn)
+            # top tail
+            if zn >= mu_flip_high:
+                add_point(zp, 2 - zn)
+        vec_2d_gaus = tfp.distributions.MultivariateNormalDiag(loc=loc, scale_diag=scale)
+        @tf.function(input_signature=[tf.TensorSpec(shape=[None, 2], dtype=tf.float32)])
+        def map_func(vals):
+            # None, 2 -> None, 1, 2
+            return tf.reduce_sum(vec_2d_gaus.prob(tf.expand_dims(vals, axis=1)), axis=1) / (max_2d_pdf * vec_2d_gaus.batch_shape[0])
+
+        return map_func
+
+    def __init__(self, *args, **kwargs):
+        self.loss_mode = kwargs.pop("loss_mode")
+        self.z_means = kwargs.pop("z_means")
+        self.z_stds = kwargs.pop("z_stds")
+        # list per class: (dm_pos, dm_neg) -> z value pairs
+        self.z_map_values = kwargs.pop("z_map_values", None)
+
+        super().__init__(*args, **kwargs)
+
+        self.z_map_func = None
+
+        self.build()
+
+    def build(self):
+
+        if not self.z_map_values:
+            self.z_map_func = None
+            return
+
+        # mapping of dms found in data to those we constructed kde's for
+        z_maps = []
+
+        for _data in tqdm(self.z_map_values, desc="Create KDEs"):
+            z_maps.append({})
+            for dm_pair, z_values in tqdm(_data.items(), desc="Create 1 KDE"):
+                assert dm_pair in dm_mapping.values()
+                # cut off for large datasets
+                # KDE calculation is faster and graph is not large
+                # value is slightly motivated on the max number of events in ggf
+                # cut_off = -1
+                # z_maps[-1][dm_pair] = self.kde(z_values[:cut_off])
+                z_maps[-1][dm_pair] = self.kde(z_values)
+
+        assert all(all(pair in _z_maps for _z_maps in z_maps) for pair in dm_mapping.values())
+
+        @tf.function(input_signature=[
+            tf.TensorSpec(shape=[None, 2], dtype=tf.float32),
+            tf.TensorSpec(shape=[None, 3], dtype=tf.float32),
+            tf.TensorSpec(shape=[None], dtype=tf.float32),
+            tf.TensorSpec(shape=[None], dtype=tf.float32),
+        ])
+        def z_map_func(z_vals, true_cls, dm_pos, dm_neg):
+            true_cls_index = tf.argmax(true_cls, axis=1)
+
+            all_map_values = []
+            all_eval_indices = []
+            for idx in range(len(z_maps)):
+                for dm_pair_kde, kde in z_maps[idx].items():
+                    eval_mask = (true_cls_index == idx)
+                    dm_mask = tf.zeros_like(eval_mask)
+                    for dm_pair_data, _dm_pair_kde in dm_mapping.items():
+                        if _dm_pair_kde == dm_pair_kde:
+                            dm_mask |= (dm_pos == dm_pair_data[0]) & (dm_neg == dm_pair_data[1])
+                    eval_mask &= dm_mask
+                    all_map_values.append(kde(z_vals[eval_mask]))
+                    all_eval_indices.append(tf.where(eval_mask)[:, 0])
+
+            all_map_values = tf.concat(all_map_values, axis=0)
+            all_eval_indices = tf.concat(all_eval_indices, axis=0)
+            return tf.gather(all_map_values, all_eval_indices)
+
+        self.z_map_func = z_map_func
+
+    def get_confg(self):
+        return {
+            "loss_mode": self.loss_mode,
+            "z_means": self.z_means,
+            "z_stds": self.z_stds,
+            "z_map_values": self.z_map_values,
+        }
+
+    def call(self, y_true, y_pred, sample_weight=None):
+        return z_loss_impl(self.loss_mode, y_true, y_pred, self.z_means, self.z_stds, self.z_map_func, sample_weight=sample_weight)
+
+
+# create z loss metric
+# class ZLossMetric(tf.keras.metrics.Mean):
+
+#     def __init__(self, *args, **kwargs):
+#         self.loss_mode = kwargs.pop("loss_mode")
+#         self.z_means = kwargs.pop("z_means")
+#         self.z_stds = kwargs.pop("z_stds")
+#         super().__init__(*args, **kwargs)
+
+#     def get_confg(self):
+#         return {
+#             "loss_mode": self.loss_mode,
+#             "z_means": self.z_means,
+#             "z_stds": self.z_stds,
+#         }
+
+#     def update_state(self, y_true, y_pred, sample_weight=None):
+#         z_loss = z_loss_impl(self.loss_mode, y_true, y_pred, self.z_means, self.z_stds, sample_weight=sample_weight)
+#         super().update_state(z_loss, sample_weight=sample_weight)
 
 
 def train(
@@ -148,14 +490,15 @@ def train(
         "genNu1_px", "genNu1_py", "genNu1_pz",
         "genNu2_px", "genNu2_py", "genNu2_pz",
     ],
+    z_target_names: list[str] = ["z1_gen", "z2_gen"],
+    additional_weight_names: list[str] = ["PUReweight", "MC_weight", "sum_weights"],
     # TODO: mass loss stuff
-
     # names of classes
     class_names: dict[int, str] = {
         0: "HH",
-        1: "DY",
-        2: "TT",
-        3: "TTH",
+        1: "TT",
+        2: "DY",
+        #3: "TTH",
     },
     # additional columns to load
     extra_columns: list[str] = [
@@ -242,6 +585,10 @@ def train(
     seed: int | None = None,
     # weight of the classification loss relative to the regression loss
     classifier_weight: float = 1.0,
+    # weight of the z loss
+    z_weight: float = 1.0,
+    # mode of z loss to use,
+    z_loss_mode: str = "spin",
 ) -> tuple[tf.keras.Model, str] | None:
     # some checks
     # TODO: adapt checks
@@ -318,7 +665,7 @@ def train(
 
     # determine which columns to read
     columns_to_read = set()
-    for name in cont_input_names + cat_input_names + regression_target_names:
+    for name in cont_input_names + cat_input_names + regression_target_names + z_target_names:
         columns_to_read.add(name)
     # column names in selections strings
     for selection_str in selections.values():
@@ -347,12 +694,17 @@ def train(
         labels_to_samples[sample.label].append(sample.name)
 
     # lists for collection data to be forwarded into the MultiDataset
-    cont_inputs_train, cont_inputs_valid = [], []
-    cat_inputs_train, cat_inputs_valid = [], []
-    targets_train, targets_valid = [], []
-    target_means, target_stds = [], []
-    labels_train, labels_valid = [], []
-    event_weights_train, event_weights_valid = [], []
+    cont_inputs_train, cont_inputs_valid, cont_inputs_eval = [], [], []
+    cat_inputs_train, cat_inputs_valid, cat_inputs_eval = [], [], []
+    targets_train, targets_valid, targets_eval = [], [], []
+    # target_means, target_stds = [], []
+    z_targets_train, z_targets_valid, z_targets_eval = [], [], []
+    # z_target_means, z_target_stds = [], []
+    labels_train, labels_valid, labels_eval = [], [], []
+    event_weights_train, event_weights_valid, event_weights_eval = [], [], []
+
+    additional_weights_train, additional_weights_valid, additional_weights_eval = [], [], []
+
 
     # keep track of yield factors
     yield_factors: dict[str, float] = {}
@@ -374,6 +726,7 @@ def train(
             cont_input_names,
             cat_input_names,
             regression_target_names,
+            z_target_names,
             n_classes,
             parameterize_year,
             parameterize_mass,
@@ -383,13 +736,40 @@ def train(
             validation_fraction,
             seed,
         ]
+        if additional_weight_names:
+            cache_key.append(additional_weight_names)
         cache_hash = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:10]
         cache_file = os.path.join(cache_dir, f"alldata_{cache_hash}.pkl")
         data_is_cached = os.path.exists(cache_file)
 
+        cache_key_eval = [
+            tuple(sample.hash_values for sample in samples),
+            tuple(transform_data_dir_cache(data_dirs[year]) for year in sorted(years)),
+            tuple(sorted(selections[year]) for year in sorted(years)),
+            sorted(columns_to_read),
+            cont_input_names,
+            cat_input_names,
+            regression_target_names,
+            z_target_names,
+            n_classes,
+            parameterize_year,
+            parameterize_mass,
+            parameterize_spin,
+            n_folds,
+            fold_index,
+            validation_fraction,
+        ]
+        if additional_weight_names:
+            cache_key_eval.append(additional_weight_names)
+        cache_hash_eval = hashlib.sha256(str(cache_key_eval).encode("utf-8")).hexdigest()[:10]
+        cache_file_eval = os.path.join(cache_dir, f"alldata_{cache_hash_eval}_evaluation.pkl")
+        eval_data_is_cached = os.path.exists(cache_file_eval)
+
+
+    # check cache for training data
     if data_is_cached:
         # read data from cache
-        print(f"loading all data from {cache_file}")
+        print(f"loading data for training from {cache_file}")
         with open(cache_file, "rb") as f:
             (
                 cont_inputs_train,
@@ -398,14 +778,20 @@ def train(
                 cat_inputs_valid,
                 targets_train,
                 targets_valid,
+                z_targets_train,
+                z_targets_valid,
                 labels_train,
                 labels_valid,
                 event_weights_train,
                 event_weights_valid,
+                additional_weights_train,
+                additional_weights_valid,
                 yield_factors,
             ) = pickle.load(f)
+        print(f"done loading data from {cache_file}")
 
     else:
+        print(f"caching data for training to {cache_file}")
         # loop through samples
         for sample in samples:
             rec = load_sample_root(
@@ -425,6 +811,9 @@ def train(
             cont_inputs = flatten_rec(rec[cont_input_names], np.float32)
             cat_inputs = flatten_rec(rec[cat_input_names], np.int32)
             targets = flatten_rec(rec[regression_target_names], np.float32)
+            z_targets = flatten_rec(rec[z_target_names], np.float32)
+            additional_weights = flatten_rec(rec[additional_weight_names], np.float32)
+
             labels = np.zeros((n_events, n_classes), dtype=np.float32)
             labels[:, sample.label] = 1
 
@@ -456,9 +845,13 @@ def train(
 
             targets_train.append(targets[train_indices])
             targets_valid.append(targets[valid_indices])
+            # target_means.append(np.mean(targets[train_indices], axis=0))
+            # target_stds.append(np.std(targets[train_indices], axis=0))
 
-            target_means.append(np.mean(targets[train_indices], axis=0))
-            target_stds.append(np.std(targets[train_indices], axis=0))
+            z_targets_train.append(z_targets[train_indices])
+            z_targets_valid.append(z_targets[valid_indices])
+            # z_target_means.append(np.mean(z_targets[train_indices], axis=0))
+            # z_target_stds.append(np.std(z_targets[train_indices], axis=0))
 
             labels_train.append(labels[train_indices])
             labels_valid.append(labels[valid_indices])
@@ -467,12 +860,35 @@ def train(
             event_weights_train.append(event_weights[train_indices][..., None])
             event_weights_valid.append(event_weights[valid_indices][..., None])
 
+            additional_weights_train.append(additional_weights[train_indices][..., None])
+            additional_weights_valid.append(additional_weights[valid_indices][..., None])
+
             # store the yield factor for later use
             yield_factors[sample.name] = (rec["PUReweight"] * rec["MC_weight"] / rec["sum_weights"]).sum()
+            if not eval_data_is_cached:
+                eval_indices = np.where(np.any(last_digit[..., None] == [fold_index], axis=1))[0]
+                cont_inputs_eval.append(cont_inputs[eval_indices])
+
+                cat_inputs_eval.append(cat_inputs[eval_indices])
+
+                targets_eval.append(targets[eval_indices])
+                # target_means.append(np.mean(targets[train_indices], axis=0))
+                # target_stds.append(np.std(targets[train_indices], axis=0))
+
+                z_targets_eval.append(z_targets[eval_indices])
+                # z_target_means.append(np.mean(z_targets[train_indices], axis=0))
+                # z_target_stds.append(np.std(z_targets[train_indices], axis=0))
+
+                labels_eval.append(labels[eval_indices])
+
+                event_weights_eval.append(event_weights[eval_indices][..., None])
+                additional_weights_eval.append(additional_weights[eval_indices][..., None])
+
+
 
         if cache_dir:
             # cache data
-            print(f"caching all data to {cache_file}")
+            print(f"caching training data to {cache_file}")
             cache_data = (
                 cont_inputs_train,
                 cont_inputs_valid,
@@ -480,15 +896,151 @@ def train(
                 cat_inputs_valid,
                 targets_train,
                 targets_valid,
+                z_targets_train,
+                z_targets_valid,
                 labels_train,
                 labels_valid,
                 event_weights_train,
                 event_weights_valid,
+                additional_weights_train,
+                additional_weights_valid,
                 yield_factors,
             )
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
             with open(cache_file, "wb") as f:
                 pickle.dump(cache_data, f)
+
+            if not eval_data_is_cached:
+                # cache data
+                print(f"caching evaluation data to {cache_file_eval}")
+                cache_data_eval = (
+                    cont_inputs_eval,
+                    cat_inputs_eval,
+                    targets_eval,
+                    z_targets_eval,
+                    labels_eval,
+                    event_weights_eval,
+                    additional_weights_eval,
+                    yield_factors,
+                )
+                os.makedirs(os.path.dirname(cache_file_eval), exist_ok=True)
+                with open(cache_file_eval, "wb") as f:
+                    pickle.dump(cache_data_eval, f)
+
+                eval_data_is_cached = os.path.exists(cache_file_eval)
+
+    if not eval_data_is_cached:
+        print(f"caching data for evaluation to {cache_file_eval}")
+
+        # loop through samples
+        for sample in samples:
+            rec = load_sample_root(
+                data_dirs[sample.year],
+                sample,
+                list(columns_to_read),
+                selections[sample.year],
+                # max_events=100,
+                cache_dir=cache_dir,
+            )
+            n_events = len(rec)
+
+            # add dynamic columns
+            rec = calc_new_columns(rec, {name: dynamic_columns[name] for name in dyn_names})
+
+            # prepare arrays
+            cont_inputs = flatten_rec(rec[cont_input_names], np.float32)
+            cat_inputs = flatten_rec(rec[cat_input_names], np.int32)
+            targets = flatten_rec(rec[regression_target_names], np.float32)
+            z_targets = flatten_rec(rec[z_target_names], np.float32)
+            additional_weights = flatten_rec(rec[additional_weight_names], np.float32)
+
+            labels = np.zeros((n_events, n_classes), dtype=np.float32)
+            labels[:, sample.label] = 1
+
+            # add year, spin and mass if given
+            if parameterize_year:
+                cat_inputs = np.append(cat_inputs, (np.ones(n_events, dtype=np.int32) * sample.year_flag)[:, None], axis=1)
+            if parameterize_mass:
+                cont_inputs = np.append(cont_inputs, (np.ones(n_events, dtype=np.float32) * sample.mass)[:, None], axis=1)
+            if parameterize_spin:
+                cat_inputs = np.append(cat_inputs, (np.ones(n_events, dtype=np.int32) * sample.spin)[:, None], axis=1)
+
+            # lookup all number of events used during training using event number and fold indices
+            last_digit = rec["EventNumber"] % n_folds
+
+            # fill dataset lists
+            eval_indices = np.where(np.any(last_digit[..., None] == [fold_index], axis=1))[0]
+            cont_inputs_eval.append(cont_inputs[eval_indices])
+
+            cat_inputs_eval.append(cat_inputs[eval_indices])
+
+            targets_eval.append(targets[eval_indices])
+            # target_means.append(np.mean(targets[train_indices], axis=0))
+            # target_stds.append(np.std(targets[train_indices], axis=0))
+
+            z_targets_eval.append(z_targets[eval_indices])
+            # z_target_means.append(np.mean(z_targets[train_indices], axis=0))
+            # z_target_stds.append(np.std(z_targets[train_indices], axis=0))
+
+            labels_eval.append(labels[eval_indices])
+
+            event_weights_eval.append(event_weights[eval_indices][..., None])
+
+            event_weights = np.array([sample.loss_weight] * len(rec), dtype="float32")
+            event_weights_eval.append(event_weights[eval_indices][..., None])
+
+            additional_weights_eval.append(additional_weights[eval_indices][..., None])
+
+            # store the yield factor for later use
+            yield_factors[sample.name] = (rec["PUReweight"] * rec["MC_weight"] / rec["sum_weights"]).sum()
+
+
+
+        if cache_dir:
+
+            # cache data
+            print(f"caching evaluation data to {cache_file_eval}")
+            cache_data_eval = (
+                cont_inputs_eval,
+                cat_inputs_eval,
+                targets_eval,
+                z_targets_eval,
+                labels_eval,
+                event_weights_eval,
+                additional_weights_eval,
+                yield_factors,
+            )
+            os.makedirs(os.path.dirname(cache_file_eval), exist_ok=True)
+            with open(cache_file_eval, "wb") as f:
+                pickle.dump(cache_data_eval, f)
+
+
+    # filter events with non-finite (transformed) z targets
+    # z_targets_train, z_targets_valid
+    # targets_train, targets_valid
+    # event_weights_valid, event_weights_train
+    # labels_train, labels_valid
+    # cont_inputs_train, cont_inputs_valid
+    # cat_inputs_train, cat_inputs_valid
+    finite_masks_train = [np.all(np.isfinite(arr), axis=1) for arr in z_targets_train]
+    finite_masks_valid = [np.all(np.isfinite(arr), axis=1) for arr in z_targets_valid]
+    apply_masks_train = lambda arrays: [arr[mask] for arr, mask in zip(arrays, finite_masks_train)]
+    apply_masks_valid = lambda arrays: [arr[mask] for arr, mask in zip(arrays, finite_masks_valid)]
+    z_targets_train = apply_masks_train(z_targets_train)
+    targets_train = apply_masks_train(targets_train)
+    labels_train = apply_masks_train(labels_train)
+    event_weights_train = apply_masks_train(event_weights_train)
+    cont_inputs_train = apply_masks_train(cont_inputs_train)
+    cat_inputs_train = apply_masks_train(cat_inputs_train)
+    z_targets_valid = apply_masks_valid(z_targets_valid)
+    targets_valid = apply_masks_valid(targets_valid)
+    labels_valid = apply_masks_valid(labels_valid)
+    event_weights_valid = apply_masks_valid(event_weights_valid)
+    cont_inputs_valid = apply_masks_valid(cont_inputs_valid)
+    cat_inputs_valid = apply_masks_valid(cat_inputs_valid)
+
+
+
 
     # compute batch weights that ensures that each class is equally represented in each batch
     # and that samples within a class are weighted according to their yield
@@ -536,9 +1088,14 @@ def train(
 
     target_means = np.mean([np.mean(t, axis=0) for t in targets_train], axis=0)
     target_stds = np.mean([np.std(t, axis=0) for t in targets_train], axis=0)
-
     targets_train = [(x - target_means) / target_stds for x in targets_train]
     targets_valid = [(x - target_means) / target_stds for x in targets_valid]
+
+    z_target_means = np.mean([np.mean(t, axis=0) for t in z_targets_train], axis=0)
+    z_target_stds = np.mean([np.std(t, axis=0) for t in z_targets_train], axis=0)
+    # z_targets_train = [(x - z_target_means) / z_target_stds for x in z_targets_train]
+    # z_targets_valid = [(x - z_target_means) / z_target_stds for x in z_targets_valid]
+
     # handle year
     if parameterize_year:
         cat_input_names.append("year")
@@ -564,25 +1121,35 @@ def train(
 
     with device:
         # live transformation of inputs to inject spin and mass for backgrounds
-        def transform(inst, cont_inputs, cat_inputs, targets, labels, weights):
+        def transform(inst, cont_inputs, cat_inputs, targets, z_targets, labels, weights):
             if parameterize_mass:
                 neg_mass = cont_inputs[:, -1] < 0
                 cont_inputs[:, -1][neg_mass] = np.random.choice(masses, size=neg_mass.sum())
             if parameterize_spin:
                 neg_spin = cat_inputs[:, -1] < 0
                 cat_inputs[:, -1][neg_spin] = np.random.choice(spins, size=neg_spin.sum())
-            return cont_inputs, cat_inputs, targets, labels, weights
+            return cont_inputs, cat_inputs, targets, z_targets, labels, weights
+
+        # concatenate combined z - cls targets
+        z_cls_train = [
+            np.concatenate([z, labels], axis=1)
+            for z, labels in zip(z_targets_train, labels_train)
+        ]
+        z_cls_valid = [
+            np.concatenate([z, labels], axis=1)
+            for z, labels in zip(z_targets_valid, labels_valid)
+        ]
 
         # build datasets
         dataset_train = MultiDataset(
-            data=zip(zip(cont_inputs_train, cat_inputs_train, targets_train, labels_train, event_weights_train), batch_weights),
+            data=zip(zip(cont_inputs_train, cat_inputs_train, targets_train, z_cls_train, labels_train, event_weights_train), batch_weights),
             batch_size=batch_size,
             kind="train",
             transform_data=transform,
             seed=seed,
         )
         dataset_valid = MultiDataset(
-            data=zip(zip(cont_inputs_valid, cat_inputs_valid, targets_valid, labels_valid, event_weights_valid), batch_weights),
+            data=zip(zip(cont_inputs_valid, cat_inputs_valid, targets_valid, z_cls_valid, labels_valid, event_weights_valid), batch_weights),
             batch_size=validation_batch_size or batch_size,
             kind="valid",
             yield_valid_rest=True,
@@ -592,6 +1159,8 @@ def train(
 
         # create the model
         model = create_model(
+            cont_input_names=cont_input_names,
+            cat_input_names=cat_input_names,
             n_cont_inputs=len(cont_input_names),
             n_cat_inputs=len(cat_input_names),
             embedding_expected_inputs=possible_cat_input_values,
@@ -600,6 +1169,8 @@ def train(
             cont_input_vars=cont_input_vars,
             target_means=target_means,
             target_stds=target_stds,
+            z_target_means=z_target_means,
+            z_target_stds=z_target_stds,
             units=units,
             connection_type=connection_type,
             activation=activation,
@@ -610,20 +1181,68 @@ def train(
             n_classes=n_classes,
         )
 
+        # read z map values
+        n_z_files = -1
+        do_cache = True
+        z_cache_hash = hashlib.sha256(str(dm_mapping).encode("utf-8")).hexdigest()[:10]
+        z_cache_path = os.path.join(cache_dir, f"z_values_files{n_z_files}_{z_cache_hash}.pkl")
+        if os.path.exists(z_cache_path) and do_cache:
+            print(f"loading z-map values from cache: {z_cache_path}")
+            with open(z_cache_path, "rb") as f:
+                z_map_values = pickle.load(f)
+        else:
+            z_map_values = []
+            for i in range(len(class_names)):
+                print(f"loading z map values for class {class_names[i]}")
+                z_map_values.append({})
+
+                z_map_values[-1][(-1, 0)] = data_z_map(class_names[i], -1, 0, n_files=n_z_files)
+                z_map_values[-1][(-1, 1)] = data_z_map(class_names[i], -1, 1, n_files=n_z_files)
+                z_map_values[-1][(-1, 10)] = data_z_map(class_names[i], -1, (10, 11), n_files=n_z_files)
+
+
+                z_map_values[-1][(0, -1)] = data_z_map(class_names[i], 0, -1, n_files=n_z_files)
+                z_map_values[-1][(0, 0)] = data_z_map(class_names[i], 0, 0, n_files=n_z_files)
+                z_map_values[-1][(0, 1)] = data_z_map(class_names[i], 0, 1, n_files=n_z_files)
+                z_map_values[-1][(0, 10)] = data_z_map(class_names[i], 0, (10, 11), n_files=n_z_files)
+
+                z_map_values[-1][(1, -1)] = data_z_map(class_names[i], 1, -1, n_files=n_z_files)
+                z_map_values[-1][(1, 0)] = data_z_map(class_names[i], 1, 0, n_files=n_z_files)
+                z_map_values[-1][(1, 1)] = data_z_map(class_names[i], 1, 1, n_files=n_z_files)
+                z_map_values[-1][(1, 10)] = data_z_map(class_names[i], 1, (10, 11), n_files=n_z_files)
+
+                z_map_values[-1][(10, -1)] = data_z_map(class_names[i], (10, 11), -1, n_files=n_z_files)
+                z_map_values[-1][(10, 0)] = data_z_map(class_names[i], (10, 11), 0, n_files=n_z_files)
+                z_map_values[-1][(10, 1)] = data_z_map(class_names[i], (10, 11), 1, n_files=n_z_files)
+                z_map_values[-1][(10, 10)] = data_z_map(class_names[i], (10, 11), (10, 11), n_files=n_z_files)
+
+            with open(z_cache_path, "wb") as f:
+                pickle.dump(z_map_values, f)
+
         # compile
         opt_cls = {
             "adam": tf.keras.optimizers.Adam,
             "adamw": tf.keras.optimizers.AdamW,
         }[optimizer]
+        # chanege for spin loss
+        z_maps_loss = ZLoss(loss_mode=z_loss_mode, z_means=z_target_means, z_stds=z_target_stds, z_map_values=z_map_values, name="z_loss")
 
+
+        print("start compiling model")
         model.compile(
             loss={
                 "regression_output": tf.keras.losses.mean_squared_error,
                 "classification_output_softmax": tf.keras.losses.categorical_crossentropy,
+                # chanege for spin loss
+                "z_cls_output": z_maps_loss, #spin
+                #"z_output": tf.keras.losses.mean_squared_error,#baseline
             },
             loss_weights={
                 "regression_output": 1.0,
                 "classification_output_softmax": classifier_weight,
+                # chanege for spin loss
+                "z_cls_output": z_weight, #spin
+                #"z_output": z_weight, #baseline
             },
             optimizer=opt_cls(
                 learning_rate=learning_rate,
@@ -635,6 +1254,10 @@ def train(
             weighted_metrics=[
                 metric_class_factory(tf.keras.metrics.MeanSquaredError)(name="mse", output_name="regression_output"),
                 metric_class_factory(tf.keras.metrics.CategoricalCrossentropy)(name="ce", output_name="classification_output_softmax"),
+                #metric_class_factory(tf.keras.metrics.MeanSquaredError)(name="z_mse", output_name="z_output"),
+                # chanege for spin loss
+                #MeanLossMetric(name="z_loss_metric"),
+                #metric_class_factory(ZLossMetric)(loss_mode="spin", z_means=z_target_means, z_stds=z_target_stds, name="z_loss_metric", output_name="z_cls_output"),
             ],
             jit_compile=jit_compile,
             run_eagerly=eager_mode,
@@ -700,11 +1323,20 @@ def train(
             model.fit(
                 x=dataset_train.create_keras_generator(
                     input_names=["cont_input", "cat_input"],
-                    target_names=["regression_output", "classification_output_softmax"],
+                    target_names=[
+                    "regression_output",
+                    # chanege for spin loss
+                    "z_cls_output",
+                    #"z_output",
+                    "classification_output_softmax"],
                 ),
                 validation_data=dataset_valid.create_keras_generator(
                     input_names=["cont_input", "cat_input"],
-                    target_names=["regression_output", "classification_output_softmax"],
+                    target_names=["regression_output",
+                    # chanege for spin loss
+                    "z_cls_output",
+                    #"z_output",
+                    "classification_output_softmax"],
                 ),
                 shuffle=False,  # the custom generators already shuffle
                 epochs=max_epochs,
@@ -713,7 +1345,7 @@ def train(
                 validation_steps=dataset_valid.batches_per_cycle,
                 callbacks=list(filter(None, fit_callbacks)),
             )
-            # model.load_weights("/gpfs/dust/cms/user/riegerma/taunn_data/store/Training/dev_weights/hbtres_LSbinary_FSreg-reg_ED5_LU5x128_CTfcn_ACTelu_BNy_LT50_DO0_BS4096_LR3.0e-03_SPINy_MASSy_FI0_SD1")  # noqa
+            #model.load_weights("/gpfs/dust/cms/user/riegerma/taunn_data/store/Training/dev_weights/hbtres_LSbinary_FSreg-reg_ED5_LU5x128_CTfcn_ACTelu_BNy_LT50_DO0_BS4096_LR3.0e-03_SPINy_MASSy_FI0_SD1")  # noqa
 
             t_end = time.perf_counter()
         except KeyboardInterrupt:
@@ -738,17 +1370,27 @@ def train(
         # perform one final validation round for verification of the best model
         print("performing final round of validation")
         results_valid = model.evaluate(
-            x=dataset_valid.create_keras_generator(input_names=["cont_input", "cat_input"], target_names=["regression_output", "classification_output_softmax"]),
+            x=dataset_valid.create_keras_generator(
+                input_names=["cont_input", "cat_input"],
+                target_names=[
+                "regression_output",
+                # chanege for spin loss
+                #"z_cls_output"
+                "z_output",
+                "classification_output_softmax"],
+            ),
             steps=dataset_valid.batches_per_cycle,
             return_dict=True,
         )
 
         # model saving
         def save_model(path):
+            tf.saved_model.save(model, path)
+            # tf.keras.Model.save_weights(filepath=path, overwrite=True)
+            #TypeError: Model.save_weights() missing 1 required positional argument: 'self'
             print(f"saving model at {path}")
             if not os.path.exists(os.path.dirname(path)):
                 os.makedirs(os.path.dirname(path))
-
             # save the model using tf's savedmodel format
             tf.keras.saving.save_model(
                 model,
@@ -756,17 +1398,23 @@ def train(
                 overwrite=True,
                 save_format="tf",
                 include_optimizer=False,
-            )
 
+            )
+            # tf.saved_model.save(
+            #     model,
+            #     path,
+            #     options=tf.saved_model.SaveOptions(experimental_image_format=True)
+            # )
             # and in the new .keras high-level format
             keras_path = os.path.join(path, "model.keras")
             if os.path.exists(keras_path):
                 os.remove(keras_path)
-            model.save(
-                keras_path,
-                overwrite=True,
-                save_format="keras",
-            )
+            print("before model.save")
+            # model.save(
+            #     keras_path,
+            #     overwrite=True,
+            #     # save_format="keras",
+            # )
 
             # save an accompanying json file with hyper-parameters, input names and other info
             meta = {
@@ -823,6 +1471,8 @@ def train(
 # via https://www.tensorflow.org/tutorials/keras/keras_tuner
 def create_model(
     *,
+    cont_input_names: list[str],
+    cat_input_names: list[str],
     n_cont_inputs: int,
     n_cat_inputs: int,
     embedding_expected_inputs: list[list[int]],
@@ -831,6 +1481,8 @@ def create_model(
     cont_input_vars: np.ndarray,
     target_means: np.ndarray,
     target_stds: np.ndarray,
+    z_target_means: np.ndarray,
+    z_target_stds: np.ndarray,
     units: tuple[list[int]],
     connection_type: str,
     activation: str,
@@ -850,6 +1502,9 @@ def create_model(
     assert connection_type in ["fcn", "res", "dense"]
     assert units
     assert len(units) in (1, 2)
+    assert "dau1_e" in cont_input_names
+    assert "dau2_e" in cont_input_names
+    assert len(z_target_means) == len(z_target_stds) == 2
 
     # get activation settings
     act_settings = activation_settings[activation]
@@ -1049,6 +1704,29 @@ def create_model(
     y2 = CustomOutputScalingLayer(target_means, target_stds, name="regression_output_hep")(y1)
     outputs["regression_output_hep"] = y2
 
+    # build predicted z values
+    p_nu1 = tf.reduce_sum(y2[:, :3]**2, axis=1)
+    p_nu2 = tf.reduce_sum(y2[:, 3:6]**2, axis=1)
+    e_vis1 = x_cont[:, cont_input_names.index("dau1_e")]
+    e_vis2 = x_cont[:, cont_input_names.index("dau2_e")]
+    z1_pred = e_vis1 / (e_vis1 + p_nu1)
+    z2_pred = e_vis2 / (e_vis2 + p_nu2)
+    # normalize them
+    # z1_pred_norm = (z1_pred - z_target_means[0]) / z_target_stds[0]
+    # z2_pred_norm = (z2_pred - z_target_means[1]) / z_target_stds[1]
+
+    dm_1 = x_cat[:, cat_input_names.index("dau1_decayMode")]
+    dm_2 = x_cat[:, cat_input_names.index("dau2_decayMode")]
+    ch_1 = x_cat[:, cat_input_names.index("dau1_charge")]
+    ch_2 = x_cat[:, cat_input_names.index("dau2_charge")]
+    dm_pos = tf.where(ch_1 > 0, dm_1, dm_2)
+    dm_neg = tf.where(ch_1 < 0, dm_1, dm_2)
+
+    # z_pred = tf.keras.layers.Concatenate(name=f"z_output", axis=1)([z1_pred_norm[..., None], z2_pred_norm[..., None]])
+    # outputs["z_output"] = z_pred
+    z_pred = tf.keras.layers.Concatenate(name=f"z_output", axis=1)([tf.expand_dims(z1_pred, axis=-1, name=None), tf.expand_dims(z2_pred, axis=-1, name=None)])
+    outputs["z_output"] = z_pred
+
     # add the classification output layer
     if n_classes > 0:
         output_layer_cls = tf.keras.layers.Dense(
@@ -1067,6 +1745,17 @@ def create_model(
     outputs["regression_last_layer"] = b
     if n_classes > 0:
         outputs["classification_last_layer"] = c
+
+    # put all outputs together(z_output2, classification4)
+    z_cls_output = tf.keras.layers.Concatenate(name=f"z_cls_output", axis=1)([
+        z_pred,
+        tf.cast(tf.expand_dims(dm_pos, axis=-1), tf.float32),
+        tf.cast(tf.expand_dims(dm_neg, axis=-1), tf.float32),
+        y4,
+    ])
+    outputs["z_cls_output"] = z_cls_output
+
+
 
     # build the model
     log_live_plots = False

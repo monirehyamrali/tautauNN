@@ -105,9 +105,9 @@ class RegTrainingParameters(Task):
         description="name of selection set; default: new_baseline",
     )
     label_set = luigi.ChoiceParameter(
-        default="multi4",
+        default="multi3",
         choices=list(cfg.label_sets.keys()),
-        description="name of label set; default: multi4",
+        description="name of label set; default: multi3",
     )
     sample_set = luigi.ChoiceParameter(
         default="default",
@@ -129,6 +129,19 @@ class RegTrainingParameters(Task):
         significant=False,
         description="skip tensorboard logging; default: False",
     )
+    cls_weight = luigi.FloatParameter(
+        default=1.0,
+        description="relative weight of the classifier loss; default: 1.0",
+    )
+    z_weight = luigi.FloatParameter(
+        default=1.0,
+        description="relative weight of the z loss; default: 1.0",
+    )
+    z_loss_mode = luigi.ChoiceParameter(
+        default="spin",
+        choices=["spin", "baseline"],
+        description="Mode for the additional z-based loss: spin=KL inspired loss, basline=MSE for z values",
+    )
     n_folds = 5
 
     def get_model_name_kwargs(self) -> dict[str, Any]:
@@ -146,6 +159,8 @@ class RegTrainingParameters(Task):
             activation=self.activation,
             l2_norm=self.l2_norm,
             dropout_rate=self.dropout_rate,
+            classifier_weight=self.cls_weight,
+            z_weight=self.z_weight,
             batch_norm=self.batch_norm,
             batch_size=self.batch_size,
             optimizer=self.optimizer,
@@ -169,7 +184,7 @@ class RegTrainingParameters(Task):
 
 class RegTraining(RegTrainingParameters):
 
-    default_store = "$TN_REG_MODEL_DIR_TOBI"
+    # default_store = "$TN_REG_MODEL_DIR_TOBI"
 
     def output(self):
         return {
@@ -221,7 +236,7 @@ class RegTraining(RegTrainingParameters):
             dropout_rate=self.dropout_rate,
             batch_norm=self.batch_norm,
             batch_size=self.batch_size,
-            validation_batch_size=self.batch_size * 16,
+            validation_batch_size=self.batch_size * 2,
             optimizer=self.optimizer,
             learning_rate=self.learning_rate,
             learning_rate_patience=self.learning_rate_patience,
@@ -235,6 +250,10 @@ class RegTraining(RegTrainingParameters):
             fold_index=self.fold,
             validation_fraction=0.25,
             seed=self.seed,
+            classifier_weight=self.cls_weight,
+            z_weight=self.z_weight,
+            z_loss_mode=self.z_loss_mode,
+            extra_columns=cfg.klub_weight_columns,
         )
 
         # run the training

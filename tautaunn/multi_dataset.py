@@ -183,6 +183,7 @@ class MultiDataset(object):
                 assert n_input_names in [0, 1]
                 yield ({input_names[0]: arrays[0]} if input_names else arrays[0]), *arrays[1:]
             else:
+                #from IPython import embed; embed(header="create_keras")
                 assert n_arrays == max(n_input_names, 1) + max(n_target_names, 1) + 1
                 x, arrays = (
                     (dict(zip(input_names, arrays[:n_input_names])), arrays[n_input_names:])

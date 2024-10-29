@@ -605,11 +605,12 @@ klub_category_columns = [
 ]
 
 klub_weight_columns = [
+    "EventNumber",
     "MC_weight",
     "PUReweight",
     "L1pref_weight",
     "trigSF",
-    # "dauSFs",  # TODO: new skims
+    "dauSFs",  # TODO: new skims
     "PUjetID_SF",
     "bTagweightReshape",
 ]
@@ -768,6 +769,54 @@ dynamic_columns = {
         ("genNu2_pt", "genNu2_eta"),
         (lambda a, b: a * np.sinh(b)),
     ),
+    "z1_gen": (
+        ("genNu1_pt", "genNu1_eta", "dau1_e"),
+        (lambda a, b, c: c / (c + a * np.sqrt(1 + np.sinh(b)**2))),
+    ),
+    "z2_gen": (
+        ("genNu2_pt", "genNu2_eta", "dau2_e"),
+        (lambda a, b, c: c / (c + a * np.sqrt(1 + np.sinh(b)**2))),
+    ),
+    # "lnz1_gen": (
+    #     ("z1_gen",),
+    #     (lambda a: np.log(a)),
+    # ),
+    # "lnz2_gen": (
+    #     ("z2_gen",),
+    #     (lambda a: np.log(a)),
+    # ),
+    # "lnrevz1_gen": (
+    #     ("z1_gen",),
+    #     (lambda a: np.log(1/a)),
+    # ),
+    # "lnrevz2_gen": (
+    #     ("z2_gen",),
+    #     (lambda a: np.log(1/a)),
+    # ),
+    # "revz1_gen": (
+    #     ("z1_gen",),
+    #     (lambda a: 1/a),
+    # ),
+    # "revz2_gen": (
+    #     ("z2_gen",),
+    #     (lambda a: 1/a),
+    # ),
+    # "erevz1_gen": (
+    #     ("z1_gen",),
+    #     (lambda a: np.exp(1/a)),
+    # ),
+    # "erevz2_gen": (
+    #     ("z2_gen",),
+    #     (lambda a: np.exp(1/a)),
+    # ),
+    # "arctanhz1_gen": (
+    #     ("z1_gen",),
+    #     (lambda a: np.arctanh(1/a)),
+    # ),
+    # "arctanhz2_gen": (
+    #     ("z2_gen",),
+    #     (lambda a: np.arctanh(1/a)),
+    # ),
     "bjet1_dphi": (
         ("bjet1_phi", rot_phi),
         (lambda a, b: phi_mpi_to_pi(a - b)),

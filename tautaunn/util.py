@@ -435,6 +435,8 @@ def create_model_name(*, model_name=None, model_prefix=None, model_suffix=None, 
         add("rs", "regression_set")
         add("lb", "lbn_set")
         add("bw", "background_weight")
+        add("cw", "classifier_weight")
+        add("zw", "z_weight")
         add("fi", "fold_index")
         add("fi", "fold_indices")
         add("sd", "seed")

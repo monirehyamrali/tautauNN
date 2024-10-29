@@ -126,6 +126,10 @@ class FadeInLayer(tf.keras.layers.Layer):
     def call(self, inputs):
         return inputs * self.factor
 
+    def get_config(self):
+        config = super().get_config()
+        return config
+
 
 class L2Metric(tf.keras.metrics.Metric):
 
